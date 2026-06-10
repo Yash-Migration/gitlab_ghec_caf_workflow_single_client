@@ -891,3 +891,150 @@ jobs:
             final-migration-summary.txt
             output_files/
             logs/
+  # ------------------ Approve before Monitoring ------------------
+  approve-before-monitoring:
+    name: approve-before-monitoring
+    runs-on: ["${{ inputs.RUNNER_LABEL }}"]
+    needs: [start-repository-migration]
+    environment:
+      name: approve-before-monitoring
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: start-repository-migration-artifacts
+          path: .
+  
+      - name: approve-before-monitoring
+        shell: bash
+        run: |
+          echo "===================================="
+          echo "MANUAL APPROVAL REQUIRED (MONITORING)"
+          echo "===================================="
+          echo
+          echo "Please review the following before monitoring:"
+          echo " - start-gl2gh-repo-migration.out"
+          echo " - output_files/migration-outputs_*.csv"
+          echo
+          echo "Verify migration IDs, target orgs and repo names."
+          echo
+          echo "Click 'Play' to continue to monitoring."        
+  # ------------------ 6) Monitor Repository Migrations ------------------
+  monitor-repository-migrations:
+    name: monitor-repository-migrations
+    runs-on: ["${{ inputs.RUNNER_LABEL }}"]
+    needs: [approve-before-monitoring]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+  
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: start-repository-migration-artifacts
+          path: .
+  
+      - name: monitor-repository-migrations
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "# 6) Monitor Repository Migrations"
+          echo "========================================"
+          set -euo pipefail
+  
+          # ✅ pick correct CSV
+          CSV_FILE=$(ls output_files/migration-outputs_*.csv | head -n1)
+  
+          [[ -f "$CSV_FILE" ]] || {
+            echo "[ERROR] migration-outputs CSV not found"
+            exit 1
+          }
+  
+          echo "[INFO] Using CSV: $CSV_FILE"
+  
+          # ✅ Dynamic parallel
+          TOTAL=$(($(wc -l < "$CSV_FILE") - 1))
+          CPU=$(nproc)
+  
+          PARALLEL=$(( CPU < TOTAL ? CPU : TOTAL ))
+          PARALLEL=$(( PARALLEL > 8 ? 8 : PARALLEL ))
+  
+          echo "[INFO] Total migrations : $TOTAL"
+          echo "[INFO] Parallel workers : $PARALLEL"
+  
+          TMP_FILE=$(mktemp)
+          OUTPUT_FILE="migration-status.csv"
+  
+          echo "github_org,github_repository,migration_id,status" > "$OUTPUT_FILE"
+  
+          # ✅ Extract correct columns (org, repo, migration_id)
+          tail -n +2 "$CSV_FILE" | \
+          awk -F',' '{print $3","$4","$6}' | \
+          xargs -I {} -P "$PARALLEL" bash -c '
+            IFS="," read -r org repo migration <<< "{}"
+  
+            echo
+            echo "======================================"
+            echo "Repo: $org/$repo"
+            echo "Migration: $migration"
+            echo "======================================"
+  
+            # ✅ Correct approach — blocking wait
+            OUTPUT=$(gh ado2gh wait-for-migration \
+              --migration-id "$migration" 2>&1)
+  
+            if echo "$OUTPUT" | grep -Ei "completed successfully|migration.*completed"; then
+              STATUS="COMPLETED"
+            elif echo "$OUTPUT" | grep -Ei "failed|error"; then
+              STATUS="FAILED"
+            else
+              STATUS="UNKNOWN"
+            fi
+  
+            echo "[FINAL] $org/$repo -> $STATUS"
+  
+            echo "$org,$repo,$migration,$STATUS" >> "'"$TMP_FILE"'"
+          '
+  
+          sort "$TMP_FILE" >> "$OUTPUT_FILE"
+          rm -f "$TMP_FILE"
+  
+          echo
+          echo "========================================"
+          echo "Migration Monitoring Summary"
+          echo "========================================"
+  
+          TOTAL=0
+          SUCCESS=0
+          FAILED=0
+          UNKNOWN=0
+  
+          while IFS=',' read -r org repo migration status; do
+            [[ "$org" == "github_org" ]] && continue
+  
+            TOTAL=$((TOTAL+1))
+  
+            case "$status" in
+              COMPLETED) SUCCESS=$((SUCCESS+1)) ;;
+              FAILED) FAILED=$((FAILED+1)) ;;
+              *) UNKNOWN=$((UNKNOWN+1)) ;;
+            esac
+          done < "$OUTPUT_FILE"
+  
+          echo "Total     : $TOTAL"
+          echo "Completed : $SUCCESS"
+          echo "Failed    : $FAILED"
+          echo "Unknown   : $UNKNOWN"
+  
+          echo
+          echo "Detailed Results"
+          echo "----------------"
+          column -s, -t "$OUTPUT_FILE"
+  
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: monitor-repository-migrations-artifacts
+          retention-days: 7
+          path: |
+            migration-status.csv      
